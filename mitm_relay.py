@@ -14,7 +14,7 @@ from threading import Thread
 from select import select
 
 BIND_WEBSERVER = ('127.0.0.1', 49999)
-BUFSIZE = 4096
+BUFSIZE = 409600
 
 __prog_name__ = 'mitm_relay'
 __version__ = 1.0
@@ -48,6 +48,12 @@ def main():
 		help='''Python script implementing the handle_request() and
 			handle_response() functions (see example). They will be
 			called before forwarding traffic to the proxy, if specified.''',
+		default=False)
+
+	parser.add_argument('-q', '--quiet',
+		action='store_true',
+		dest='quiet',
+		help='''Disable dumping packet content to stdout''',
 		default=False)
 
 	parser.add_argument('-p', '--proxy',
@@ -113,7 +119,7 @@ def main():
 		dest='client_timeout',
 		type=int,
 		help='Client socket connection timeout',
-		default=False)
+		default=None)
 
 	parser.add_argument('-st', '--server-timeout',
 		action='store',
@@ -121,7 +127,7 @@ def main():
 		dest='server_timeout',
 		type=int,
 		help='Server socket connection timeout',
-		default=False)
+		default=None)
 
 	cfg = parser.parse_args()
 	cfg.prog_name = __prog_name__
@@ -171,13 +177,18 @@ def main():
 
 	# If a ssl keylog file was specified, dump (pre-)master secrets
 	if cfg.sslkeylog:
-		try:
-			import sslkeylog
-			sslkeylog.set_keylog(cfg.sslkeylog)
+		if sys.version_info.major >= 3 and sys.version_info.minor >= 8:
+			# SSLKEYLOG is good in python3
+			os.environ['SSLKEYLOGFILE'] = cfg.sslkeylog.name
+			pass
+		else:
+			try:
+				import sslkeylog
+				sslkeylog.set_keylog(cfg.sslkeylog)
 
-		except Exception as e:
-			print(color("[!] %s" % str(e), 1, 31))
-			sys.exit()
+			except Exception as e:
+				print(color("[!] %s" % str(e), 1, 31))
+				sys.exit()
 
 
 	server_threads = []
@@ -275,30 +286,74 @@ def do_relay_tcp(client_sock, server_sock, cfg):
 		elif cfg.tlsver in ["ssl2", "ssl3"]:
 			cfg_ssl_version = ssl.PROTOCOL_SSLv23
 
+	hasSSLWrapped = False
+
 	while True:
-
-		# Peek for the beginnings of an ssl handshake
-		try:
-			packet = client_sock.recv(BUFSIZE, socket.MSG_PEEK | socket.MSG_DONTWAIT)
-
-			if packet.startswith(b'\x16\x03'): # SSL/TLS Handshake.
-
-				if not (cfg.cert and cfg.key):
-					print(color("[!] SSL/TLS handshake detected, provide a server cert and key to enable interception.", 1, 31))
-
-				else:
-					print(color('---------------------- Wrapping sockets ----------------------', 1, 32))
-					client_sock = ssl.wrap_socket(client_sock, server_side=True, suppress_ragged_eofs=True, certfile=cfg.cert.name, keyfile=cfg.key.name, ssl_version=cfg_ssl_version)
-
-					# Use client-side cert/key if provided.
-					if (cfg.clientcert and cfg.clientkey):
-						server_sock = ssl.wrap_socket(server_sock, suppress_ragged_eofs=True, certfile=cfg.clientcert.name, keyfile=cfg.clientkey.name, ssl_version=cfg_ssl_version)
-					else:
-						server_sock = ssl.wrap_socket(server_sock, suppress_ragged_eofs=True, ssl_version=cfg_ssl_version)
-		except:
-			pass
-
 		receiving, _, _ = select([client_sock, server_sock], [], [])
+		if not hasSSLWrapped:
+			if client_sock in receiving:
+				# Peek for the beginnings of an ssl handshake
+				try:
+					packet = client_sock.recv(BUFSIZE, socket.MSG_PEEK | getattr(socket, "MSG_DONTWAIT", 0))
+
+					if packet.startswith(b'\x16\x03'): # SSL/TLS Handshake.
+						print("[i] Wrapping ssl handshake: " + packet.hex())
+						tls_ver = cfg_ssl_version
+
+						if packet[5:6] == b'\x01': # handshake msg
+							tlsver_num = int.from_bytes(packet[9:10], 'big')
+						else:
+							tlsver_num = 0xffff
+
+						# Too heavy to use Scapy to parse
+						# from scapy.layers.tls.record import TLS				
+						# parsed_handshake = TLS(packet)
+						# tlsver_num = parsed_handshake.msg[0].version
+						# print(repr(parsed_handshake))
+						
+						if tlsver_num == 0x0301:
+							print("[i] Got TLSv1.0")
+							# tls_ver = ssl.PROTOCOL_SSLv23
+							tls_ver = ssl.PROTOCOL_TLSv1
+						elif tlsver_num == 0x0302:
+							print("[i] Got TLSv1.1")
+							tls_ver = ssl.PROTOCOL_TLSv1_1
+						elif tlsver_num == 0x0303:
+							print("[i] Got TLSv1.2")
+							tls_ver = ssl.PROTOCOL_TLSv1_2
+						elif tlsver_num == 0x0300:
+							print("[i] Got SSLv3")
+							tls_ver = ssl.PROTOCOL_SSLv23
+						else:
+							raise Exception("Unknown TLS version: 0x%x" % tls_ver)
+
+						if not (cfg.cert and cfg.key):
+							print(color("[!] SSL/TLS handshake detected, provide a server cert and key to enable interception.", 1, 31))
+
+						else:
+							print(color('---------------------- Wrapping sockets ----------------------', 1, 32))
+							sslc = ssl.SSLContext(tls_ver)
+							# sslc.verify_mode = ssl.CERT_NONE
+							if hasattr(sslc, 'keylog_filename'):
+								sslc.keylog_filename = cfg.sslkeylog.name
+							sslc.load_cert_chain('cert/server.pem', 'cert/private.key')
+							sslc.set_ciphers("DEFAULT@SECLEVEL=0")
+							client_sock = sslc.wrap_socket(client_sock, server_side=True, suppress_ragged_eofs=True)
+							
+							# client_sock = ssl.wrap_socket(client_sock, server_side=True, suppress_ragged_eofs=True, cert_reqs=ssl.CERT_NONE, certfile=cfg.cert.name, keyfile=cfg.key.name, ssl_version=tls_ver)
+
+							# Use client-side cert/key if provided.
+							if (cfg.clientcert and cfg.clientkey):
+								print(color("[i] Connecting to server using %s %s" % (cfg.clientcert.name, cfg.clientkey.name), 1, 31))
+								server_sock = ssl.wrap_socket(server_sock, suppress_ragged_eofs=True, certfile=cfg.clientcert.name, keyfile=cfg.clientkey.name, ssl_version=cfg_ssl_version)
+							else:
+								server_sock = ssl.wrap_socket(server_sock, suppress_ragged_eofs=True, ssl_version=tls_ver)
+						
+						hasSSLWrapped = True
+				except BlockingIOError:
+					pass
+				except:
+					import traceback; traceback.print_exc()
 
 		try:
 			if client_sock in receiving:
@@ -405,11 +460,16 @@ def proxify(message, cfg, client_peer, server_peer, to_server=True):
 
 	if to_server:
 		msg_str = color(data_repr(message), 0, 93)
-		print("C >> S [ %s >> %s ] [ %s ] [ %d ] %s %s" % (client_str, server_str, date_str, len(message), modified_str if modified else '', msg_str))
-
+		print("C >> S [ %s >> %s ] [ %s ] [ %d ] %s" % (
+			client_str, server_str, date_str, len(message), modified_str if modified else '',
+			))
 	else:
 		msg_str = color(data_repr(message), 0, 33)
-		print("S >> C [ %s >> %s ] [ %s ] [ %d ] %s %s" % (server_str, client_str, date_str, len(message), modified_str if modified else '', msg_str))
+		print("S >> C [ %s >> %s ] [ %s ] [ %d ] %s" % (
+			server_str, client_str, date_str, len(message),  modified_str if modified else '',
+			))
+	if not cfg.quiet:
+		print(msg_str)
 
 	return message
 
